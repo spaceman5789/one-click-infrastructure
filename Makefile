@@ -1,7 +1,7 @@
 TF_DIR=terraform
 ANS_DIR=ansible
 
-.PHONY: up destroy test
+.PHONY: up destroy
 
 up:
 	cd $(TF_DIR) && terraform init

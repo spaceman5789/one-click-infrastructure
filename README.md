@@ -1,166 +1,160 @@
-# One-Click Infrastructure (UTM, 2 VMs) — Terraform + Ansible + Nginx + Postgres
+# One-Click Infrastructure: Terraform + Ansible on Local VMs
 
-Поднимаем окружение “с нуля” одной командой на macOS, используя **UTM**:
-- **VM `app-vm`**: Nginx (reverse proxy) + Docker-контейнер приложения (FastAPI)
-- **VM `db-vm`**: Docker-контейнер Postgres
+> `make up` builds a two-VM environment from scratch on macOS (UTM): Terraform provisions the VMs, Ansible configures them, and a FastAPI app goes live behind Nginx with a PostgreSQL backend.
 
-Цель проекта — показать полный DevOps-цикл:
-- IaC (Terraform)
-- конфигурация (Ansible, идемпотентно)
-- деплой приложения (Docker)
-- reverse proxy (Nginx)
-- pipeline проверки (GitHub Actions)
+![Terraform](https://img.shields.io/badge/Terraform-7B42BC?logo=terraform&logoColor=white)
+![Ansible](https://img.shields.io/badge/Ansible-EE0000?logo=ansible&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)
+![UTM](https://img.shields.io/badge/UTM-macOS-000000?logo=apple&logoColor=white)
+
+The goal is to show the full DevOps loop on a laptop, without a cloud bill: **IaC → configuration management → containerized deploy → reverse proxy → verification**, all triggered by one command.
 
 ---
 
 ## Contents
 
-- [One-Click Infrastructure (UTM, 2 VMs) — Terraform + Ansible + Nginx + Postgres](#one-click-infrastructure-utm-2-vms--terraform--ansible--nginx--postgres)
-  - [Contents](#contents)
-  - [Architecture](#architecture)
-    - [Components](#components)
-    - [Network Model](#network-model)
-  - [Prerequisites](#prerequisites)
-    - [On macOS](#on-macos)
-  - [Quick Start](#quick-start)
-  - [Full Walkthrough](#full-walkthrough)
-    - [1. Template VM Preparation (UTM)](#1-template-vm-preparation-utm)
-    - [2. Infrastructure (Terraform)](#2-infrastructure-terraform)
-    - [3. Configuration (Ansible)](#3-configuration-ansible)
-    - [4. App + Reverse Proxy](#4-app--reverse-proxy)
-    - [5. Verification](#5-verification)
-  - [Frontend & CSS](#frontend--css)
+- [Architecture](#architecture)
+- [How It Works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Step-by-Step](#step-by-step)
+- [Project Structure](#project-structure)
+- [Notes & Roadmap](#notes--roadmap)
 
 ---
 
 ## Architecture
 
-### Components
+```mermaid
+flowchart LR
+    subgraph mac[macOS host]
+        M[make up] --> TF[Terraform]
+        TF -->|osascript / utmctl| UTM[UTM]
+        TF -->|generates| INV[inventory.ini]
+        INV --> ANS[Ansible]
+    end
+    subgraph net[UTM Shared Network]
+        subgraph app[app-vm]
+            NG[Nginx :80] --> API[FastAPI container :8000]
+        end
+        subgraph db[db-vm]
+            PG[(PostgreSQL 16 container :5432)]
+        end
+        API --> PG
+    end
+    UTM -. clones from tmpl-ubuntu .-> app
+    UTM -. clones from tmpl-ubuntu .-> db
+    ANS -->|SSH| app
+    ANS -->|SSH| db
+```
 
-- **Terraform**
-  - управляет жизненным циклом VM в UTM через скрипты (`osascript`)
-  - генерирует `ansible/inventory.ini`
+## How It Works
 
-- **Ansible**
-  - ставит Docker + compose plugin
-  - поднимает Postgres на `db-vm`
-  - билдит и запускает приложение на `app-vm`
-  - настраивает Nginx reverse proxy → `http://<APP_IP>/health`
-
-### Network Model
-
-Обе VM должны быть в режиме сети UTM:
-- **Network Mode = macOS Shared Network**
-
-Это позволяет:
-- macOS (хосту) обращаться к VM по IP
-- VM “видеть” друг друга
-
-> Примечание: IP VM вытягивается из UTM через QEMU Guest Agent, поэтому он обязателен внутри шаблонной VM.
-
----
+| Layer | Tool | Responsibility |
+|-------|------|----------------|
+| Provisioning | **Terraform** (`external`, `local`, `null` providers) | Clones and starts `app-vm` and `db-vm` from a UTM template, reads their IPs via the QEMU guest agent, generates the Ansible inventory, destroys VMs on `terraform destroy` |
+| Configuration | **Ansible** roles | `docker` — installs Docker · `db` — runs PostgreSQL · `app` — builds and runs the API image · `nginx` — reverse proxy |
+| Application | **FastAPI** in Docker | `GET /health` → `{"status":"ok"}`, `GET /health/db` → `{"db":"ok"}` (checks the DB connection) |
+| Edge | **Nginx** | Proxies `:80` → `127.0.0.1:8000` (the API is not exposed directly) |
 
 ## Prerequisites
 
-### Вся эта штука работает только только на macOS, потому что используется гипервизор UTM, который есть только на маке, поэтому не подойдет для других, по типу VMware и так далее.
-
-Установи инструменты:
+> macOS only — the project drives the [UTM](https://mac.getutm.app/) hypervisor.
 
 ```bash
 brew install terraform ansible make
+brew install --cask utm
 ```
 
----
+A UTM template VM named **`tmpl-ubuntu`** (Debian 12 ARM64 works) with:
+
+- the OS installed and the ISO ejected (CD/DVD → *Empty*), so it boots from disk
+- SSH access for user `debian`
+- **QEMU Guest Agent** — Terraform gets the VM IPs through it:
+
+  ```bash
+  sudo apt update && sudo apt install -y qemu-guest-agent
+  sudo systemctl enable --now qemu-guest-agent
+  ```
+
+- network mode **Shared Network**, so the host and both VMs can reach each other
 
 ## Quick Start
 
 ```bash
-make up
+make up        # terraform apply → ansible-playbook → curl /health
+make destroy   # removes both VMs (even if Terraform state is gone)
 ```
 
-Если команда упадет на первом запуске, смотри полный walkthrough ниже: обычно причина — неготовый UTM шаблон (guest agent, ISO).
+If the first run fails, it is almost always the template: missing guest agent or the installer ISO still attached.
 
----
+## Step-by-Step
 
-## Full Walkthrough
-
-Ниже — полная, пошаговая история запуска проекта (как он реально разворачивается).
-
-### 1. Template VM Preparation (UTM)
-
-1) В UTM должен быть шаблон `tmpl-ubuntu` (у меня это Debian 12 ARM64).
-2) Внутри шаблона должна быть установленная ОС и **QEMU Guest Agent**:
+**1. Provision VMs**
 
 ```bash
-sudo apt update
-sudo apt install -y qemu-guest-agent
-sudo systemctl enable --now qemu-guest-agent
-sudo systemctl status qemu-guest-agent
-```
-
-3) В UTM нужно **отключить ISO** (CD/DVD → Eject/Empty), чтобы VM загружалась в установленную систему, а не в установщик.
-
-Почему это важно:
-- Terraform/UTM получают IP через guest agent. Без него IP не будет, и Terraform упадет.
-
-### 2. Infrastructure (Terraform)
-
-Terraform делает три вещи:
-- Создает/запускает `app-vm` и `db-vm` из шаблона.
-- Получает IP обеих VM через guest agent.
-- Генерирует `ansible/inventory.ini`.
-
-Запуск:
-
-```bash
-cd terraform && terraform apply -auto-approve
-```
-
-Полезные команды:
-
-```bash
+cd terraform && terraform init && terraform apply -auto-approve
 terraform output -raw app_ip
 terraform output -raw db_ip
 ```
 
-### 3. Configuration (Ansible)
-
-Ansible подключается по SSH к обеим VM под пользователем `debian` и выполняет роли:
-- `docker` — установка Docker
-- `app` — копирование исходников, сборка образа, запуск контейнера
-- `nginx` — reverse proxy на app
-- `db` — контейнер Postgres
-
-Запуск:
+**2. Configure them**
 
 ```bash
+ansible-galaxy collection install community.docker
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
 ```
 
-### 4. App + Reverse Proxy
-
-На `app-vm`:
-- FastAPI приложение запускается в Docker.
-- Nginx проксирует запросы на `http://127.0.0.1:8000`.
-
-Endpoints:
-- `GET /health` → `{"status":"ok"}`
-- `GET /health/db` → `{"db":"ok"}` (проверка связи с Postgres)
-
-### 5. Verification
+**3. Verify**
 
 ```bash
 APP_IP=$(cd terraform && terraform output -raw app_ip)
 curl -i http://$APP_IP/health
 curl -i http://$APP_IP/health/db
-```
 
-Проверка Postgres контейнера:
-
-```bash
 DB_IP=$(cd terraform && terraform output -raw db_ip)
-ssh -o StrictHostKeyChecking=no debian@$DB_IP "docker ps | grep postgres"
+ssh debian@$DB_IP "docker ps | grep postgres"
 ```
+
+## Project Structure
+
+```text
+.
+├── Makefile                     # up / destroy
+├── terraform/
+│   └── main.tf                  # VM lifecycle, inventory generation, outputs
+├── scripts/
+│   ├── utm_ensure_vms.sh        # clone/start VMs, return IPs as JSON
+│   └── utm_destroy_vms.sh       # stop and delete VMs
+├── ansible/
+│   ├── playbook.yml
+│   └── roles/{docker,db,app,nginx}/
+└── app/
+    ├── Dockerfile
+    ├── main.py                  # FastAPI health endpoints
+    └── requirements.txt
+```
+
+`ansible/inventory.ini`, Terraform state and provider binaries are generated locally and git-ignored.
+
+## Notes & Roadmap
+
+Credentials in the roles are lab defaults for an isolated local network. Next steps:
+
+- [ ] Move DB credentials to `ansible-vault`
+- [ ] Bind PostgreSQL to the private network only and add a firewall
+- [ ] Add a GitHub Actions workflow with `terraform fmt/validate` and `ansible-lint`
+- [ ] Add Prometheus node exporters to both VMs
 
 ---
 
+## Related Projects
+
+- [aws-infrastructure-terraform](https://github.com/spaceman5789/aws-infrastructure-terraform) — the same 2-tier idea on real AWS
+- [ansible-server-automation](https://github.com/spaceman5789/ansible-server-automation) — single-host Nginx + Docker + HTTPS playbook
+
+## Author
+
+**Denis Nazarov** — DevOps Engineer · [GitHub](https://github.com/spaceman5789) · [Portfolio](https://denzo-portfolio.site)
