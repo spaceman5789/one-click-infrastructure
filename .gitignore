@@ -10,3 +10,5 @@ ansible/inventory.ini
 # Python
 __pycache__/
 .venv/
+.claude/
+CLAUDE.md
